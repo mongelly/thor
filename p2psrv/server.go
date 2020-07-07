@@ -7,12 +7,14 @@ package p2psrv
 
 import (
 	"math"
+	"net"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/discv5"
+	"github.com/ethereum/go-ethereum/p2p/nat"
 	"github.com/inconshreveable/log15"
 	"github.com/vechain/thor/cache"
 	"github.com/vechain/thor/co"
@@ -22,7 +24,9 @@ var log = log15.New("pkg", "p2psrv")
 
 // Server p2p server wraps ethereum's p2p.Server, and handles discovery v5 stuff.
 type Server struct {
+	opts            Options
 	srv             *p2p.Server
+	discv5          *discv5.Network
 	goes            co.Goes
 	done            chan struct{}
 	knownNodes      *cache.PrioCache
@@ -32,12 +36,6 @@ type Server struct {
 
 // New create a p2p server.
 func New(opts *Options) *Server {
-
-	v5nodes := make([]*discv5.Node, 0, len(opts.BootstrapNodes))
-	for _, n := range opts.BootstrapNodes {
-		v5nodes = append(v5nodes, discv5.NewNode(discv5.NodeID(n.ID), n.IP, n.UDP, n.TCP))
-	}
-
 	knownNodes := cache.NewPrioCache(5)
 	discoveredNodes := cache.NewRandCache(128)
 	for _, node := range opts.KnownNodes {
@@ -46,19 +44,19 @@ func New(opts *Options) *Server {
 	}
 
 	return &Server{
+		opts: *opts,
 		srv: &p2p.Server{
 			Config: p2p.Config{
-				Name:             opts.Name,
-				PrivateKey:       opts.PrivateKey,
-				MaxPeers:         opts.MaxPeers,
-				NoDiscovery:      true,
-				DiscoveryV5:      !opts.NoDiscovery,
-				ListenAddr:       opts.ListenAddr,
-				BootstrapNodesV5: v5nodes,
-				NetRestrict:      opts.NetRestrict,
-				NAT:              opts.NAT,
-				NoDial:           opts.NoDial,
-				DialRatio:        int(math.Sqrt(float64(opts.MaxPeers))),
+				Name:        opts.Name,
+				PrivateKey:  opts.PrivateKey,
+				MaxPeers:    opts.MaxPeers,
+				NoDiscovery: true,
+				DiscoveryV5: false, // disable discovery inside p2p.Server instance
+				ListenAddr:  opts.ListenAddr,
+				NetRestrict: opts.NetRestrict,
+				NAT:         opts.NAT,
+				NoDial:      opts.NoDial,
+				DialRatio:   int(math.Sqrt(float64(opts.MaxPeers))),
 			},
 		},
 		done:            make(chan struct{}),
@@ -103,27 +101,35 @@ func (s *Server) Start(protocols []*Protocol) error {
 	if err := s.srv.Start(); err != nil {
 		return err
 	}
+	if !s.opts.NoDiscovery {
+		if err := s.listenDiscV5(); err != nil {
+			return err
+		}
+		for _, proto := range protocols {
+			topicToRegister := discv5.Topic(proto.DiscTopic)
+			log.Debug("registering topic", "topic", topicToRegister)
+			s.goes.Go(func() {
+				s.discv5.RegisterTopic(topicToRegister, s.done)
+			})
+		}
+		if len(protocols) > 0 {
+			topicToSearch := discv5.Topic(protocols[len(protocols)-1].DiscTopic)
+			log.Debug("searching topic", "topic", topicToSearch)
+			s.goes.Go(func() { s.discoverLoop(topicToSearch) })
+		}
+	}
+
 	log.Debug("start up", "self", s.Self())
 
-	for _, proto := range protocols {
-		topicToRegister := discv5.Topic(proto.DiscTopic)
-		log.Debug("registering topic", "topic", topicToRegister)
-		s.goes.Go(func() {
-			s.srv.DiscV5.RegisterTopic(topicToRegister, s.done)
-		})
-	}
-
-	if len(protocols) > 0 {
-		topicToSearch := discv5.Topic(protocols[len(protocols)-1].DiscTopic)
-		log.Debug("searching topic", "topic", topicToSearch)
-		s.goes.Go(func() { s.discoverLoop(topicToSearch) })
-		s.goes.Go(s.dialLoop)
-	}
+	s.goes.Go(s.dialLoop)
 	return nil
 }
 
 // Stop stop the server.
 func (s *Server) Stop() {
+	if s.discv5 != nil {
+		s.discv5.Close()
+	}
 	s.srv.Stop()
 	close(s.done)
 	s.goes.Wait()
@@ -156,8 +162,55 @@ func (s *Server) NodeInfo() *p2p.NodeInfo {
 	return s.srv.NodeInfo()
 }
 
+func (s *Server) listenDiscV5() (err error) {
+	// borrowed from ethereum/p2p.Server.Start
+	addr, err := net.ResolveUDPAddr("udp", s.opts.ListenAddr)
+	if err != nil {
+		return err
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return err
+	}
+
+	realaddr := conn.LocalAddr().(*net.UDPAddr)
+	if s.opts.NAT != nil {
+		if !realaddr.IP.IsLoopback() {
+			s.goes.Go(func() { nat.Map(s.opts.NAT, s.done, "udp", realaddr.Port, realaddr.Port, "vechain discovery") })
+		}
+		// TODO: react to external IP changes over time.
+		if ext, err := s.opts.NAT.ExternalIP(); err == nil {
+			realaddr = &net.UDPAddr{IP: ext, Port: realaddr.Port}
+		}
+	}
+
+	network, err := discv5.ListenUDP(s.opts.PrivateKey, conn, realaddr, "", s.opts.NetRestrict)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			network.Close()
+		}
+	}()
+
+	bootnodes := make([]*discv5.Node, 0, len(s.opts.BootstrapNodes)+len(s.opts.KnownNodes))
+	for _, node := range s.opts.BootstrapNodes {
+		bootnodes = append(bootnodes, discv5.NewNode(discv5.NodeID(node.ID), node.IP, node.UDP, node.TCP))
+	}
+	for _, node := range s.opts.KnownNodes {
+		bootnodes = append(bootnodes, discv5.NewNode(discv5.NodeID(node.ID), node.IP, node.UDP, node.TCP))
+	}
+
+	if err := network.SetFallbackNodes(bootnodes); err != nil {
+		return err
+	}
+	s.discv5 = network
+	return nil
+}
+
 func (s *Server) discoverLoop(topic discv5.Topic) {
-	if s.srv.DiscV5 == nil {
+	if s.discv5 == nil {
 		return
 	}
 
@@ -167,7 +220,7 @@ func (s *Server) discoverLoop(topic discv5.Topic) {
 	discLookups := make(chan bool, 100)
 
 	s.goes.Go(func() {
-		s.srv.DiscV5.SearchTopic(topic, setPeriod, discNodes, discLookups)
+		s.discv5.SearchTopic(topic, setPeriod, discNodes, discLookups)
 	})
 
 	var (
@@ -207,14 +260,21 @@ func (s *Server) dialLoop() {
 	const nonFastDialDur = 2 * time.Second
 	const stableDialDur = 10 * time.Second
 
-	// fast dialing initially
-	ticker := time.NewTicker(fastDialDur)
-	defer ticker.Stop()
-
 	dialCount := 0
 	for {
+		delay := fastDialDur
+		if dialCount == 20 {
+			delay = nonFastDialDur
+		} else if dialCount > 20 {
+			if s.srv.PeerCount() > s.srv.MaxPeers/2 {
+				delay = stableDialDur
+			} else {
+				delay = nonFastDialDur
+			}
+		}
+
 		select {
-		case <-ticker.C:
+		case <-time.After(delay):
 			if s.srv.DialRatio < 1 {
 				continue
 			}
@@ -245,18 +305,6 @@ func (s *Server) dialLoop() {
 			}()
 
 			dialCount++
-			if dialCount == 20 {
-				ticker.Stop()
-				ticker = time.NewTicker(nonFastDialDur)
-			} else if dialCount > 20 {
-				if s.srv.PeerCount() > s.srv.MaxPeers/2 {
-					ticker.Stop()
-					ticker = time.NewTicker(stableDialDur)
-				} else {
-					ticker.Stop()
-					ticker = time.NewTicker(nonFastDialDur)
-				}
-			}
 		case <-s.done:
 			return
 		}

@@ -7,12 +7,23 @@ package events
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/vechain/thor/api/transactions"
+	"github.com/vechain/thor/block"
+	"github.com/vechain/thor/chain"
 	"github.com/vechain/thor/logdb"
 	"github.com/vechain/thor/thor"
 )
+
+type LogMeta struct {
+	BlockID        thor.Bytes32 `json:"blockID"`
+	BlockNumber    uint32       `json:"blockNumber"`
+	BlockTimestamp uint64       `json:"blockTimestamp"`
+	TxID           thor.Bytes32 `json:"txID"`
+	TxOrigin       thor.Address `json:"txOrigin"`
+	ClauseIndex    uint32       `json:"clauseIndex"`
+}
 
 type TopicSet struct {
 	Topic0 *thor.Bytes32 `json:"topic0"`
@@ -22,57 +33,26 @@ type TopicSet struct {
 	Topic4 *thor.Bytes32 `json:"topic4"`
 }
 
-type Filter struct {
-	Address   *thor.Address
-	TopicSets []*TopicSet
-	Range     *logdb.Range
-	Options   *logdb.Options
-	Order     logdb.Order
-}
-
-func convertFilter(filter *Filter) *logdb.EventFilter {
-	f := &logdb.EventFilter{
-		Address: filter.Address,
-		Range:   filter.Range,
-		Options: filter.Options,
-		Order:   filter.Order,
-	}
-	if len(filter.TopicSets) > 0 {
-		var topicSets [][5]*thor.Bytes32
-		for _, topicSet := range filter.TopicSets {
-			var topics [5]*thor.Bytes32
-			topics[0] = topicSet.Topic0
-			topics[1] = topicSet.Topic1
-			topics[2] = topicSet.Topic2
-			topics[3] = topicSet.Topic3
-			topics[4] = topicSet.Topic4
-			topicSets = append(topicSets, topics)
-		}
-		f.TopicSet = topicSets
-	}
-	return f
-}
-
 // FilteredEvent only comes from one contract
 type FilteredEvent struct {
-	Topics []*thor.Bytes32           `json:"topics"`
-	Data   string                    `json:"data"`
-	Block  transactions.BlockContext `json:"block"`
-	Tx     transactions.TxContext    `json:"tx"`
+	Address thor.Address    `json:"address"`
+	Topics  []*thor.Bytes32 `json:"topics"`
+	Data    string          `json:"data"`
+	Meta    LogMeta         `json:"meta"`
 }
 
 //convert a logdb.Event into a json format Event
 func convertEvent(event *logdb.Event) *FilteredEvent {
 	fe := FilteredEvent{
-		Data: hexutil.Encode(event.Data),
-		Block: transactions.BlockContext{
-			ID:        event.BlockID,
-			Number:    event.BlockNumber,
-			Timestamp: event.BlockTime,
-		},
-		Tx: transactions.TxContext{
-			ID:     event.TxID,
-			Origin: event.TxOrigin,
+		Address: event.Address,
+		Data:    hexutil.Encode(event.Data),
+		Meta: LogMeta{
+			BlockID:        event.BlockID,
+			BlockNumber:    event.BlockNumber,
+			BlockTimestamp: event.BlockTime,
+			TxID:           event.TxID,
+			TxOrigin:       event.TxOrigin,
+			ClauseIndex:    event.ClauseIndex,
 		},
 	}
 	fe.Topics = make([]*thor.Bytes32, 0)
@@ -87,20 +67,122 @@ func convertEvent(event *logdb.Event) *FilteredEvent {
 func (e *FilteredEvent) String() string {
 	return fmt.Sprintf(`
 		Event(
+			address: 	   %v,
 			topics:        %v,
 			data:          %v,
-			block: (id     %v,
-					num    %v,
-					time   %v),
-			tx:    (id     %v,
-					origin %v)
+			meta: (blockID     %v,
+				blockNumber    %v,
+				blockTimestamp %v),
+				txID     %v,
+				txOrigin %v,
+				clauseIndex %v)
 			)`,
+		e.Address,
 		e.Topics,
 		e.Data,
-		e.Block.ID,
-		e.Block.Number,
-		e.Block.Timestamp,
-		e.Tx.ID,
-		e.Tx.Origin,
+		e.Meta.BlockID,
+		e.Meta.BlockNumber,
+		e.Meta.BlockTimestamp,
+		e.Meta.TxID,
+		e.Meta.TxOrigin,
+		e.Meta.ClauseIndex,
 	)
+}
+
+type EventCriteria struct {
+	Address *thor.Address `json:"address"`
+	TopicSet
+}
+
+type EventFilter struct {
+	CriteriaSet []*EventCriteria `json:"criteriaSet"`
+	Range       *Range           `json:"range"`
+	Options     *logdb.Options   `json:"options"`
+	Order       logdb.Order      `json:"order"`
+}
+
+func convertEventFilter(chain *chain.Chain, filter *EventFilter) (*logdb.EventFilter, error) {
+	rng, err := ConvertRange(chain, filter.Range)
+	if err != nil {
+		return nil, err
+	}
+	f := &logdb.EventFilter{
+		Range:   rng,
+		Options: filter.Options,
+		Order:   filter.Order,
+	}
+	if len(filter.CriteriaSet) > 0 {
+		criterias := make([]*logdb.EventCriteria, len(filter.CriteriaSet))
+		for i, criteria := range filter.CriteriaSet {
+			var topics [5]*thor.Bytes32
+			topics[0] = criteria.Topic0
+			topics[1] = criteria.Topic1
+			topics[2] = criteria.Topic2
+			topics[3] = criteria.Topic3
+			topics[4] = criteria.Topic4
+			criteria := &logdb.EventCriteria{
+				Address: criteria.Address,
+				Topics:  topics,
+			}
+			criterias[i] = criteria
+		}
+		f.CriteriaSet = criterias
+	}
+	return f, nil
+}
+
+type RangeType string
+
+const (
+	BlockRangeType RangeType = "block"
+	TimeRangeType  RangeType = "time"
+)
+
+type Range struct {
+	Unit RangeType
+	From uint64
+	To   uint64
+}
+
+func ConvertRange(chain *chain.Chain, r *Range) (*logdb.Range, error) {
+	if r == nil {
+		return nil, nil
+	}
+	if r.Unit == TimeRangeType {
+		emptyRange := logdb.Range{
+			From: math.MaxUint32,
+			To:   math.MaxUint32,
+		}
+
+		genesis, err := chain.GetBlockHeader(0)
+		if err != nil {
+			return nil, err
+		}
+		if r.To < genesis.Timestamp() {
+			return &emptyRange, nil
+		}
+		head, err := chain.GetBlockHeader(block.Number(chain.HeadID()))
+		if r.From > head.Timestamp() {
+			return &emptyRange, nil
+		}
+
+		fromHeader, err := chain.FindBlockHeaderByTimestamp(r.From, 1)
+		if err != nil {
+			return nil, err
+		}
+
+		toHeader, err := chain.FindBlockHeaderByTimestamp(r.To, -1)
+		if err != nil {
+			return nil, err
+		}
+
+		return &logdb.Range{
+			From: fromHeader.Number(),
+			To:   toHeader.Number(),
+		}, nil
+	}
+	return &logdb.Range{
+		From: uint32(r.From),
+		To:   uint32(r.To),
+	}, nil
 }

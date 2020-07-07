@@ -21,11 +21,9 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
 	"github.com/vechain/thor/api/transactions"
-	"github.com/vechain/thor/block"
 	"github.com/vechain/thor/chain"
 	"github.com/vechain/thor/genesis"
-	"github.com/vechain/thor/logdb"
-	"github.com/vechain/thor/lvldb"
+	"github.com/vechain/thor/muxdb"
 	"github.com/vechain/thor/packer"
 	"github.com/vechain/thor/state"
 	"github.com/vechain/thor/thor"
@@ -33,7 +31,7 @@ import (
 	"github.com/vechain/thor/txpool"
 )
 
-var c *chain.Chain
+var repo *chain.Repository
 var ts *httptest.Server
 var transaction *tx.Transaction
 
@@ -46,16 +44,12 @@ func TestTransaction(t *testing.T) {
 }
 
 func getTx(t *testing.T) {
-	raw, err := transactions.ConvertTransaction(transaction)
-	if err != nil {
-		t.Fatal(err)
-	}
 	res := httpGet(t, ts.URL+"/transactions/"+transaction.ID().String())
 	var rtx *transactions.Transaction
 	if err := json.Unmarshal(res, &rtx); err != nil {
 		t.Fatal(err)
 	}
-	checkTx(t, raw, rtx)
+	checkTx(t, transaction, rtx)
 
 	res = httpGet(t, ts.URL+"/transactions/"+transaction.ID().String()+"?raw=true")
 	var rawTx map[string]interface{}
@@ -79,10 +73,16 @@ func getTxReceipt(t *testing.T) {
 }
 
 func senTx(t *testing.T) {
+	var blockRef = tx.NewBlockRef(0)
+	var chainTag = repo.ChainTag()
+	var expiration = uint32(10)
+	var gas = uint64(21000)
+
 	tx := new(tx.Builder).
-		ChainTag(c.Tag()).
-		Expiration(10).
-		Gas(21000).
+		BlockRef(blockRef).
+		ChainTag(chainTag).
+		Expiration(expiration).
+		Gas(gas).
 		Build()
 	sig, err := crypto.Sign(tx.SigningHash().Bytes(), genesis.DevAccounts()[0].PrivateKey)
 	if err != nil {
@@ -93,19 +93,20 @@ func senTx(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := json.Marshal(transactions.RawTx{Raw: hexutil.Encode(rlpTx)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	res := httpPost(t, ts.URL+"/transactions", raw)
+
+	res := httpPost(t, ts.URL+"/transactions", transactions.RawTx{Raw: hexutil.Encode(rlpTx)})
 	var txObj map[string]string
 	if err = json.Unmarshal(res, &txObj); err != nil {
 		t.Fatal(err)
 	}
-	assert.Equal(t, tx.ID().String(), txObj["id"], "shoudl be the same transaction")
+	assert.Equal(t, tx.ID().String(), txObj["id"], "should be the same transaction id")
 }
 
-func httpPost(t *testing.T, url string, data []byte) []byte {
+func httpPost(t *testing.T, url string, obj interface{}) []byte {
+	data, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
 	res, err := http.Post(url, "application/x-www-form-urlencoded", bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
@@ -119,42 +120,19 @@ func httpPost(t *testing.T, url string, data []byte) []byte {
 }
 
 func initTransactionServer(t *testing.T) {
-	logDB, err := logdb.NewMem()
+	db := muxdb.NewMem()
+	stater := state.NewStater(db)
+	gene := genesis.NewDevnet()
+
+	b, _, _, err := gene.Build(stater)
 	if err != nil {
 		t.Fatal(err)
 	}
-	from := thor.BytesToAddress([]byte("from"))
-	to := thor.BytesToAddress([]byte("to"))
-	value := big.NewInt(10)
-	header := new(block.Builder).Build().Header()
-	count := 100
-	for i := 0; i < count; i++ {
-		transLog := &tx.Transfer{
-			Sender:    from,
-			Recipient: to,
-			Amount:    value,
-		}
-		header = new(block.Builder).ParentID(header.ID()).Build().Header()
-		if err := logDB.Prepare(header).ForTransaction(thor.Bytes32{}, from).
-			Insert(nil, tx.Transfers{transLog}).Commit(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	db, _ := lvldb.NewMem()
-	stateC := state.NewCreator(db)
-	gene, err := genesis.NewDevnet()
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, _, err := gene.Build(stateC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, _ = chain.New(db, b)
+	repo, _ = chain.NewRepository(db, b)
 	addr := thor.BytesToAddress([]byte("to"))
 	cla := tx.NewClause(&addr).WithValue(big.NewInt(10000))
 	transaction = new(tx.Builder).
-		ChainTag(c.Tag()).
+		ChainTag(repo.ChainTag()).
 		GasPriceCoef(1).
 		Expiration(10).
 		Gas(21000).
@@ -168,7 +146,7 @@ func initTransactionServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	transaction = transaction.WithSignature(sig)
-	packer := packer.New(c, stateC, genesis.DevAccounts()[0].Address, genesis.DevAccounts()[0].Address)
+	packer := packer.New(repo, stater, genesis.DevAccounts()[0].Address, &genesis.DevAccounts()[0].Address, thor.NoFork)
 	flow, err := packer.Schedule(b.Header(), uint64(time.Now().Unix()))
 	err = flow.Adopt(transaction)
 	if err != nil {
@@ -181,24 +159,31 @@ func initTransactionServer(t *testing.T) {
 	if _, err := stage.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.AddBlock(b, receipts); err != nil {
+	if err := repo.AddBlock(b, receipts); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetBestBlockID(b.Header().ID()); err != nil {
 		t.Fatal(err)
 	}
 	router := mux.NewRouter()
-	transactions.New(c, txpool.New(c, stateC)).Mount(router, "/transactions")
+	transactions.New(repo, txpool.New(repo, stater, txpool.Options{Limit: 10000, LimitPerAccount: 16, MaxLifetime: 10 * time.Minute})).Mount(router, "/transactions")
 	ts = httptest.NewServer(router)
 
 }
 
-func checkTx(t *testing.T, expectedTx *transactions.Transaction, actualTx *transactions.Transaction) {
-	assert.Equal(t, expectedTx.Origin, actualTx.Origin)
-	assert.Equal(t, expectedTx.ID, actualTx.ID)
-	assert.Equal(t, expectedTx.GasPriceCoef, actualTx.GasPriceCoef)
-	assert.Equal(t, expectedTx.Gas, actualTx.Gas)
-	for i, c := range expectedTx.Clauses {
-		assert.Equal(t, string(c.Data), string(actualTx.Clauses[i].Data))
-		assert.Equal(t, c.Value, actualTx.Clauses[i].Value)
-		assert.Equal(t, c.To, actualTx.Clauses[i].To)
+func checkTx(t *testing.T, expectedTx *tx.Transaction, actualTx *transactions.Transaction) {
+	origin, err := expectedTx.Origin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, origin, actualTx.Origin)
+	assert.Equal(t, expectedTx.ID(), actualTx.ID)
+	assert.Equal(t, expectedTx.GasPriceCoef(), actualTx.GasPriceCoef)
+	assert.Equal(t, expectedTx.Gas(), actualTx.Gas)
+	for i, c := range expectedTx.Clauses() {
+		assert.Equal(t, hexutil.Encode(c.Data()), actualTx.Clauses[i].Data)
+		assert.Equal(t, *c.Value(), big.Int(actualTx.Clauses[i].Value))
+		assert.Equal(t, c.To(), actualTx.Clauses[i].To)
 	}
 
 }

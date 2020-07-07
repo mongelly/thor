@@ -10,25 +10,32 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
+	"github.com/pkg/errors"
 	"github.com/vechain/thor/api/utils"
+	"github.com/vechain/thor/chain"
 	"github.com/vechain/thor/logdb"
-	"github.com/vechain/thor/thor"
 )
 
 type Events struct {
-	db *logdb.LogDB
+	repo *chain.Repository
+	db   *logdb.LogDB
 }
 
-func New(db *logdb.LogDB) *Events {
+func New(repo *chain.Repository, db *logdb.LogDB) *Events {
 	return &Events{
+		repo,
 		db,
 	}
 }
 
 //Filter query events with option
-func (e *Events) filter(ctx context.Context, filter *Filter) ([]*FilteredEvent, error) {
-	f := convertFilter(filter)
-	events, err := e.db.FilterEvents(ctx, f)
+func (e *Events) filter(ctx context.Context, ef *EventFilter) ([]*FilteredEvent, error) {
+	chain := e.repo.NewBestChain()
+	filter, err := convertEventFilter(chain, ef)
+	if err != nil {
+		return nil, err
+	}
+	events, err := e.db.FilterEvents(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -40,24 +47,9 @@ func (e *Events) filter(ctx context.Context, filter *Filter) ([]*FilteredEvent, 
 }
 
 func (e *Events) handleFilter(w http.ResponseWriter, req *http.Request) error {
-	var filter Filter
+	var filter EventFilter
 	if err := utils.ParseJSON(req.Body, &filter); err != nil {
-		return err
-	}
-	req.Body.Close()
-	query := req.URL.Query()
-	if query.Get("address") != "" {
-		addr, err := thor.ParseAddress(query.Get("address"))
-		if err != nil {
-			return utils.BadRequest(err, "address")
-		}
-		filter.Address = &addr
-	}
-	order := query.Get("order")
-	if order != string(logdb.DESC) {
-		filter.Order = logdb.ASC
-	} else {
-		filter.Order = logdb.DESC
+		return utils.BadRequest(errors.WithMessage(err, "body"))
 	}
 	fes, err := e.filter(req.Context(), &filter)
 	if err != nil {

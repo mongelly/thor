@@ -8,6 +8,7 @@ package authority
 import (
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/vechain/thor/state"
 	"github.com/vechain/thor/thor"
 )
@@ -28,141 +29,238 @@ func New(addr thor.Address, state *state.State) *Authority {
 	return &Authority{addr, state}
 }
 
-func (a *Authority) getStorage(key thor.Bytes32, val interface{}) {
-	a.state.GetStructuredStorage(a.addr, key, val)
-}
-
-func (a *Authority) setStorage(key thor.Bytes32, val interface{}) {
-	a.state.SetStructuredStorage(a.addr, key, val)
-}
-
-// Get get candidate by signer address.
-func (a *Authority) Get(signer thor.Address) (*Candidate, bool) {
+func (a *Authority) getEntry(nodeMaster thor.Address) (*entry, error) {
 	var entry entry
-	a.getStorage(thor.BytesToBytes32(signer[:]), &entry)
-	if entry.IsEmpty() {
-		return nil, false
+	if err := a.state.DecodeStorage(a.addr, thor.BytesToBytes32(nodeMaster[:]), func(raw []byte) error {
+		if len(raw) == 0 {
+			return nil
+		}
+		return rlp.DecodeBytes(raw, &entry)
+	}); err != nil {
+		return nil, err
 	}
-	return &Candidate{
-		Signer:   signer,
-		Endorsor: entry.Endorsor,
-		Identity: entry.Identity,
-		Active:   entry.Active,
-	}, true
+	return &entry, nil
 }
 
-func (a *Authority) getAndSet(signer thor.Address, f func(entry *entry) bool) bool {
-	key := thor.BytesToBytes32(signer[:])
-	var entry entry
-	a.getStorage(key, &entry)
-	if !f(&entry) {
-		return false
+func (a *Authority) setEntry(nodeMaster thor.Address, entry *entry) error {
+	return a.state.EncodeStorage(a.addr, thor.BytesToBytes32(nodeMaster[:]), func() ([]byte, error) {
+		if entry.IsEmpty() {
+			return nil, nil
+		}
+		return rlp.EncodeToBytes(entry)
+	})
+}
+
+func (a *Authority) getAddressPtr(key thor.Bytes32) (addr *thor.Address, err error) {
+	err = a.state.DecodeStorage(a.addr, key, func(raw []byte) error {
+		if len(raw) == 0 {
+			return nil
+		}
+		return rlp.DecodeBytes(raw, &addr)
+	})
+	return
+}
+
+func (a *Authority) setAddressPtr(key thor.Bytes32, addr *thor.Address) error {
+	return a.state.EncodeStorage(a.addr, key, func() ([]byte, error) {
+		if addr == nil {
+			return nil, nil
+		}
+		return rlp.EncodeToBytes(addr)
+	})
+}
+
+// Get get candidate by node master address.
+func (a *Authority) Get(nodeMaster thor.Address) (listed bool, endorsor thor.Address, identity thor.Bytes32, active bool, err error) {
+	var entry *entry
+	if entry, err = a.getEntry(nodeMaster); err != nil {
+		return
 	}
-	a.setStorage(key, &entry)
-	return true
+	if entry.IsLinked() {
+		return true, entry.Endorsor, entry.Identity, entry.Active, nil
+	}
+	// if it's the only node, IsLinked will be false.
+	// check whether it's the head.
+	var ptr *thor.Address
+	if ptr, err = a.getAddressPtr(headKey); err != nil {
+		return
+	}
+	listed = ptr != nil && *ptr == nodeMaster
+	return listed, entry.Endorsor, entry.Identity, entry.Active, nil
 }
 
 // Add add a new candidate.
-func (a *Authority) Add(candidate *Candidate) bool {
-	var tail addressPtr
-	a.getStorage(tailKey, &tail)
+func (a *Authority) Add(nodeMaster thor.Address, endorsor thor.Address, identity thor.Bytes32) (bool, error) {
+	entry, err := a.getEntry(nodeMaster)
+	if err != nil {
+		return false, err
+	}
+	if !entry.IsEmpty() {
+		return false, nil
+	}
 
-	if !a.getAndSet(candidate.Signer, func(entry *entry) bool {
-		if !entry.IsEmpty() {
-			return false
+	entry.Endorsor = endorsor
+	entry.Identity = identity
+	entry.Active = true // defaults to active
+
+	tailPtr, err := a.getAddressPtr(tailKey)
+	if err != nil {
+		return false, err
+	}
+	entry.Prev = tailPtr
+
+	if err := a.setAddressPtr(tailKey, &nodeMaster); err != nil {
+		return false, err
+	}
+	if tailPtr == nil {
+		if err := a.setAddressPtr(headKey, &nodeMaster); err != nil {
+			return false, err
 		}
-		entry.Endorsor = candidate.Endorsor
-		entry.Identity = candidate.Identity
-		entry.Active = candidate.Active
-		entry.Prev = tail.Address
-		return true
-	}) {
-		return false
+	} else {
+		tailEntry, err := a.getEntry(*tailPtr)
+		if err != nil {
+			return false, err
+		}
+		tailEntry.Next = &nodeMaster
+		if err := a.setEntry(*tailPtr, tailEntry); err != nil {
+			return false, err
+		}
 	}
 
-	a.setStorage(tailKey, &addressPtr{&candidate.Signer})
-	if tail.Address == nil {
-		a.setStorage(headKey, &addressPtr{&candidate.Signer})
-	} else {
-		a.getAndSet(*tail.Address, func(entry *entry) bool {
-			entry.Next = &candidate.Signer
-			return true
-		})
+	if err := a.setEntry(nodeMaster, entry); err != nil {
+		return false, err
 	}
-	return true
+	return true, nil
 }
 
-// Remove remove an candidate by given signer address.
-func (a *Authority) Remove(signer thor.Address) bool {
-	return a.getAndSet(signer, func(ent *entry) bool {
-		if ent.IsEmpty() {
-			return false
-		}
-		if ent.Prev == nil {
-			a.setStorage(headKey, &addressPtr{ent.Next})
-		} else {
-			a.getAndSet(*ent.Prev, func(prev *entry) bool {
-				prev.Next = ent.Next
-				return true
-			})
-		}
+// Revoke revoke candidate by given node master address.
+// The entry is not removed, but set unlisted and inactive.
+func (a *Authority) Revoke(nodeMaster thor.Address) (bool, error) {
+	entry, err := a.getEntry(nodeMaster)
+	if err != nil {
+		return false, err
+	}
+	if !entry.IsLinked() {
+		return false, nil
+	}
 
-		if ent.Next == nil {
-			a.setStorage(tailKey, &addressPtr{ent.Prev})
-		} else {
-			a.getAndSet(*ent.Next, func(next *entry) bool {
-				next.Prev = ent.Prev
-				return true
-			})
+	if entry.Prev == nil {
+		if err := a.setAddressPtr(headKey, entry.Next); err != nil {
+			return false, err
 		}
+	} else {
+		prevEntry, err := a.getEntry(*entry.Prev)
+		if err != nil {
+			return false, err
+		}
+		prevEntry.Next = entry.Next
+		if err := a.setEntry(*entry.Prev, prevEntry); err != nil {
+			return false, err
+		}
+	}
 
-		*ent = entry{}
-		return true
-	})
+	if entry.Next == nil {
+		if err := a.setAddressPtr(tailKey, entry.Prev); err != nil {
+			return false, err
+		}
+	} else {
+		nextEntry, err := a.getEntry(*entry.Next)
+		if err != nil {
+			return false, err
+		}
+		nextEntry.Prev = entry.Prev
+		if err := a.setEntry(*entry.Next, nextEntry); err != nil {
+			return false, err
+		}
+	}
+
+	entry.Next = nil
+	entry.Prev = nil     // unlist
+	entry.Active = false // and set to inactive
+	if err := a.setEntry(nodeMaster, entry); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Update update candidate's status.
-func (a *Authority) Update(signer thor.Address, active bool) bool {
-	return a.getAndSet(signer, func(entry *entry) bool {
-		if entry.IsEmpty() {
-			return false
-		}
-		entry.Active = active
-		return true
-	})
+func (a *Authority) Update(nodeMaster thor.Address, active bool) (bool, error) {
+	entry, err := a.getEntry(nodeMaster)
+	if err != nil {
+		return false, err
+	}
+	if !entry.IsLinked() {
+		return false, nil
+	}
+	entry.Active = active
+	if err := a.setEntry(nodeMaster, entry); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Candidates picks a batch of candidates up to limit, that satisfy given endorsement.
-func (a *Authority) Candidates(endorsement *big.Int, limit uint64) []*Candidate {
-	var ptr addressPtr
-	a.getStorage(headKey, &ptr)
+func (a *Authority) Candidates(endorsement *big.Int, limit uint64) ([]*Candidate, error) {
+	ptr, err := a.getAddressPtr(headKey)
+	if err != nil {
+		return nil, err
+	}
 	candidates := make([]*Candidate, 0, limit)
-	for ptr.Address != nil && uint64(len(candidates)) < limit {
-		var entry entry
-		a.getStorage(thor.BytesToBytes32(ptr.Address[:]), &entry)
-		if bal := a.state.GetBalance(entry.Endorsor); bal.Cmp(endorsement) >= 0 {
+	for ptr != nil && uint64(len(candidates)) < limit {
+		entry, err := a.getEntry(*ptr)
+		if err != nil {
+			return nil, err
+		}
+		bal, err := a.state.GetBalance(entry.Endorsor)
+		if err != nil {
+			return nil, err
+		}
+		if bal.Cmp(endorsement) >= 0 {
 			candidates = append(candidates, &Candidate{
-				Signer:   *ptr.Address,
-				Endorsor: entry.Endorsor,
-				Identity: entry.Identity,
-				Active:   entry.Active,
+				NodeMaster: *ptr,
+				Endorsor:   entry.Endorsor,
+				Identity:   entry.Identity,
+				Active:     entry.Active,
 			})
 		}
-		ptr.Address = entry.Next
+		ptr = entry.Next
 	}
-	return candidates
+	return candidates, nil
 }
 
-// First returns signer address of first entry.
-func (a *Authority) First() *thor.Address {
-	var ptr addressPtr
-	a.getStorage(headKey, &ptr)
-	return ptr.Address
+// AllCandidates lists all registered candidates.
+func (a *Authority) AllCandidates() ([]*Candidate, error) {
+	ptr, err := a.getAddressPtr(headKey)
+	if err != nil {
+		return nil, err
+	}
+	var candidates []*Candidate
+	for ptr != nil {
+		entry, err := a.getEntry(*ptr)
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, &Candidate{
+			NodeMaster: *ptr,
+			Endorsor:   entry.Endorsor,
+			Identity:   entry.Identity,
+			Active:     entry.Active,
+		})
+		ptr = entry.Next
+	}
+	return candidates, nil
 }
 
-// Next returns address of next signer after given signer.
-func (a *Authority) Next(signer thor.Address) *thor.Address {
-	var entry entry
-	a.getStorage(thor.BytesToBytes32(signer[:]), &entry)
-	return entry.Next
+// First returns node master address of first entry.
+func (a *Authority) First() (*thor.Address, error) {
+	return a.getAddressPtr(headKey)
+}
+
+// Next returns address of next node master address after given node master address.
+func (a *Authority) Next(nodeMaster thor.Address) (*thor.Address, error) {
+	entry, err := a.getEntry(nodeMaster)
+	if err != nil {
+		return nil, err
+	}
+	return entry.Next, nil
 }

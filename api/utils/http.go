@@ -9,8 +9,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-
-	"github.com/pkg/errors"
 )
 
 type httpError struct {
@@ -31,17 +29,17 @@ func HTTPError(cause error, status int) error {
 }
 
 // BadRequest convenience method to create http bad request error.
-func BadRequest(cause error, msg string) error {
+func BadRequest(cause error) error {
 	return &httpError{
-		cause:  errors.Wrap(cause, msg),
+		cause:  cause,
 		status: http.StatusBadRequest,
 	}
 }
 
 // Forbidden convenience method to create http forbidden error.
-func Forbidden(cause error, msg string) error {
+func Forbidden(cause error) error {
 	return &httpError{
-		cause:  errors.Wrap(cause, msg),
+		cause:  cause,
 		status: http.StatusForbidden,
 	}
 }
@@ -82,15 +80,10 @@ func ParseJSON(r io.Reader, v interface{}) error {
 	return decoder.Decode(v)
 }
 
-// WriteJSON reponse a object in JSON enconding.
+// WriteJSON response an object in JSON encoding.
 func WriteJSON(w http.ResponseWriter, obj interface{}) error {
-	data, err := json.Marshal(obj)
-	if err != nil {
-		return HTTPError(err, 500)
-	}
 	w.Header().Set("Content-Type", JSONContentType)
-	w.Write(data)
-	return nil
+	return json.NewEncoder(w).Encode(obj)
 }
 
 // M shortcut for type map[string]interface{}.

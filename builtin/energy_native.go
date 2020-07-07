@@ -20,12 +20,18 @@ func init() {
 	}{
 		{"native_totalSupply", func(env *xenv.Environment) []interface{} {
 			env.UseGas(thor.SloadGas)
-			supply := Energy.Native(env.State(), env.BlockContext().Time).TotalSupply()
+			supply, err := Energy.Native(env.State(), env.BlockContext().Time).TotalSupply()
+			if err != nil {
+				panic(err)
+			}
 			return []interface{}{supply}
 		}},
 		{"native_totalBurned", func(env *xenv.Environment) []interface{} {
 			env.UseGas(thor.SloadGas)
-			burned := Energy.Native(env.State(), env.BlockContext().Time).TotalBurned()
+			burned, err := Energy.Native(env.State(), env.BlockContext().Time).TotalBurned()
+			if err != nil {
+				panic(err)
+			}
 			return []interface{}{burned}
 		}},
 		{"native_get", func(env *xenv.Environment) []interface{} {
@@ -33,7 +39,10 @@ func init() {
 			env.ParseArgs(&addr)
 
 			env.UseGas(thor.GetBalanceGas)
-			bal := Energy.Native(env.State(), env.BlockContext().Time).Get(thor.Address(addr))
+			bal, err := Energy.Native(env.State(), env.BlockContext().Time).Get(thor.Address(addr))
+			if err != nil {
+				panic(err)
+			}
 			return []interface{}{bal}
 		}},
 		{"native_add", func(env *xenv.Environment) []interface{} {
@@ -42,14 +51,24 @@ func init() {
 				Amount *big.Int
 			}
 			env.ParseArgs(&args)
+			if args.Amount.Sign() == 0 {
+				return nil
+			}
 
 			env.UseGas(thor.GetBalanceGas)
-			if env.State().Exists(thor.Address(args.Addr)) {
-				env.UseGas(thor.SstoreResetGas - thor.GetBalanceGas)
-			} else {
-				env.UseGas(thor.SstoreSetGas - thor.GetBalanceGas)
+
+			exist, err := env.State().Exists(thor.Address(args.Addr))
+			if err != nil {
+				panic(err)
 			}
-			Energy.Native(env.State(), env.BlockContext().Time).Add(thor.Address(args.Addr), args.Amount)
+			if exist {
+				env.UseGas(thor.SstoreResetGas)
+			} else {
+				env.UseGas(thor.SstoreSetGas)
+			}
+			if err := Energy.Native(env.State(), env.BlockContext().Time).Add(thor.Address(args.Addr), args.Amount); err != nil {
+				panic(err)
+			}
 			return nil
 		}},
 		{"native_sub", func(env *xenv.Environment) []interface{} {
@@ -58,11 +77,17 @@ func init() {
 				Amount *big.Int
 			}
 			env.ParseArgs(&args)
+			if args.Amount.Sign() == 0 {
+				return []interface{}{true}
+			}
 
 			env.UseGas(thor.GetBalanceGas)
-			ok := Energy.Native(env.State(), env.BlockContext().Time).Sub(thor.Address(args.Addr), args.Amount)
+			ok, err := Energy.Native(env.State(), env.BlockContext().Time).Sub(thor.Address(args.Addr), args.Amount)
+			if err != nil {
+				panic(err)
+			}
 			if ok {
-				env.UseGas(thor.SstoreResetGas - thor.GetBalanceGas)
+				env.UseGas(thor.SstoreResetGas)
 			}
 			return []interface{}{ok}
 		}},
@@ -71,7 +96,10 @@ func init() {
 			env.ParseArgs(&addr)
 
 			env.UseGas(thor.GetBalanceGas)
-			master := env.State().GetMaster(thor.Address(addr))
+			master, err := env.State().GetMaster(thor.Address(addr))
+			if err != nil {
+				panic(err)
+			}
 			return []interface{}{master}
 		}},
 	}

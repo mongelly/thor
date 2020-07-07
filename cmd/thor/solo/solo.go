@@ -10,9 +10,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/inconshreveable/log15"
+	"github.com/pkg/errors"
 	"github.com/vechain/thor/block"
 	"github.com/vechain/thor/chain"
+	"github.com/vechain/thor/cmd/thor/bandwidth"
 	"github.com/vechain/thor/co"
 	"github.com/vechain/thor/genesis"
 	"github.com/vechain/thor/logdb"
@@ -23,35 +27,49 @@ import (
 	"github.com/vechain/thor/txpool"
 )
 
-var log = log15.New()
+var log = log15.New("pkg", "solo")
 
 // Solo mode is the standalone client without p2p server
 type Solo struct {
-	chain       *chain.Chain
+	repo        *chain.Repository
 	txPool      *txpool.TxPool
 	packer      *packer.Packer
 	logDB       *logdb.LogDB
 	bestBlockCh chan *block.Block
+	gasLimit    uint64
+	bandwidth   bandwidth.Bandwidth
 	onDemand    bool
+	skipLogs    bool
 }
 
 // New returns Solo instance
 func New(
-	chain *chain.Chain,
-	stateCreator *state.Creator,
+	repo *chain.Repository,
+	stater *state.Stater,
 	logDB *logdb.LogDB,
 	txPool *txpool.TxPool,
+	gasLimit uint64,
 	onDemand bool,
+	skipLogs bool,
+	forkConfig thor.ForkConfig,
 ) *Solo {
 	return &Solo{
-		chain:    chain,
-		txPool:   txPool,
-		packer:   packer.New(chain, stateCreator, genesis.DevAccounts()[0].Address, genesis.DevAccounts()[0].Address),
+		repo:   repo,
+		txPool: txPool,
+		packer: packer.New(
+			repo,
+			stater,
+			genesis.DevAccounts()[0].Address,
+			&genesis.DevAccounts()[0].Address,
+			forkConfig),
 		logDB:    logDB,
+		gasLimit: gasLimit,
+		skipLogs: skipLogs,
 		onDemand: onDemand,
 	}
 }
 
+// Run runs the packer for solo
 func (s *Solo) Run(ctx context.Context) error {
 	goes := &co.Goes{}
 
@@ -61,11 +79,7 @@ func (s *Solo) Run(ctx context.Context) error {
 	}()
 
 	goes.Go(func() {
-		s.interval(ctx)
-	})
-
-	goes.Go(func() {
-		s.watcher(ctx)
+		s.loop(ctx)
 	})
 
 	log.Info("prepared to pack block")
@@ -73,115 +87,108 @@ func (s *Solo) Run(ctx context.Context) error {
 	return nil
 }
 
-func (s *Solo) interval(ctx context.Context) {
-	if s.onDemand {
-		return
-	}
-	ticker := time.NewTicker(time.Duration(10) * time.Second)
-	defer ticker.Stop()
-	s.packing()
-
+func (s *Solo) loop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("stopping interval packing service......")
 			return
-		case <-ticker.C:
-			s.packing()
+		case <-time.After(time.Duration(1) * time.Second):
+			if left := uint64(time.Now().Unix()) % thor.BlockInterval; left == 0 {
+				if err := s.packing(s.txPool.Executables(), false); err != nil {
+					log.Error("failed to pack block", "err", err)
+				}
+			} else if s.onDemand {
+				pendingTxs := s.txPool.Executables()
+				if len(pendingTxs) > 0{
+					if err := s.packing(pendingTxs, true); err != nil {
+						log.Error("failed to pack block", "err", err)
+					}
+				}
+			}
 		}
 	}
 }
 
-func (s *Solo) watcher(ctx context.Context) {
+func (s *Solo) packing(pendingTxs tx.Transactions, onDemand bool) error {
+	best := s.repo.BestBlock()
+	now := uint64(time.Now().Unix())
 
-	ch := make(chan *tx.Transaction, 10)
-	sub := s.txPool.SubscribeNewTransaction(ch)
-	defer sub.Unsubscribe()
-
-	for {
-		select {
-		case tx := <-ch:
-			singer, err := tx.Signer()
-			if err != nil {
-				singer = thor.Address{}
-			}
-			log.Info("new Tx", "id", tx.ID(), "signer", singer)
-			if s.onDemand {
-				s.packing()
-			}
-			continue
-		case <-ctx.Done():
-			log.Info("stopping watcher service......")
-			return
+	var txsToRemove []*tx.Transaction
+	defer func() {
+		for _, tx := range txsToRemove {
+			s.txPool.Remove(tx.Hash(), tx.ID())
 		}
+	}()
+
+	if s.gasLimit == 0 {
+		suggested := s.bandwidth.SuggestGasLimit()
+		s.packer.SetTargetGasLimit(suggested)
 	}
-}
 
-func (s *Solo) packing() {
-
-	best := s.chain.BestBlock()
-
-	flow, err := s.packer.Mock(best.Header(), uint64(time.Now().Unix()))
+	flow, err := s.packer.Mock(best.Header(), now, s.gasLimit)
 	if err != nil {
-		log.Error(fmt.Sprintf("%+v", err))
+		return errors.WithMessage(err, "mock packer")
 	}
 
-	pendingTxs := s.txPool.Pending(true)
-
+	startTime := mclock.Now()
 	for _, tx := range pendingTxs {
-		err := flow.Adopt(tx)
-		if err != nil {
-			log.Error("executing transaction", "error", fmt.Sprintf("%+v", err.Error()))
-		}
-		switch {
-		case packer.IsKnownTx(err) || packer.IsBadTx(err):
-			s.txPool.Remove(tx.ID())
-		case packer.IsGasLimitReached(err):
-			break
-		case packer.IsTxNotAdoptableNow(err):
-			continue
-		default:
-			s.txPool.Remove(tx.ID())
+		if err := flow.Adopt(tx); err != nil {
+			if packer.IsGasLimitReached(err) {
+				break
+			}
+			if packer.IsTxNotAdoptableNow(err) {
+				continue
+			}
+			txsToRemove = append(txsToRemove, tx)
 		}
 	}
 
 	b, stage, receipts, err := flow.Pack(genesis.DevAccounts()[0].PrivateKey)
 	if err != nil {
-		log.Error(fmt.Sprintf("%+v", err))
+		return errors.WithMessage(err, "pack")
 	}
-	if _, err := stage.Commit(); err != nil {
-		log.Error(fmt.Sprintf("%+v", err))
+	execElapsed := mclock.Now() - startTime
+
+	// If there is no tx packed in the on-demanded block then skip
+	if onDemand && len(b.Transactions()) == 0 {
+		return nil
 	}
 
-	// If there is no tx packed in the on-demand mode then skip
-	if s.onDemand && len(b.Transactions()) == 0 {
-		return
+	if _, err := stage.Commit(); err != nil {
+		return errors.WithMessage(err, "commit state")
+	}
+
+	// ignore fork when solo
+	if err := s.repo.AddBlock(b, receipts); err != nil {
+		return errors.WithMessage(err, "commit block")
+	}
+	if err := s.repo.SetBestBlockID(b.Header().ID()); err != nil {
+		return errors.WithMessage(err, "set best block")
+	}
+
+	if !s.skipLogs {
+		if err := s.logDB.Log(func(w *logdb.Writer) error {
+			return w.Write(b, receipts)
+		}); err != nil {
+			return errors.WithMessage(err, "commit log")
+		}
+	}
+
+	commitElapsed := mclock.Now() - startTime - execElapsed
+
+	if v, updated := s.bandwidth.Update(b.Header(), time.Duration(execElapsed+commitElapsed)); updated {
+		log.Debug("bandwidth updated", "gps", v)
 	}
 
 	blockID := b.Header().ID()
 	log.Info("📦 new block packed",
 		"txs", len(receipts),
 		"mgas", float64(b.Header().GasUsed())/1000/1000,
+		"et", fmt.Sprintf("%v|%v", common.PrettyDuration(execElapsed), common.PrettyDuration(commitElapsed)),
 		"id", fmt.Sprintf("[#%v…%x]", block.Number(blockID), blockID[28:]),
 	)
 	log.Debug(b.String())
 
-	batch := s.logDB.Prepare(b.Header())
-	for i, tx := range b.Transactions() {
-		origin, _ := tx.Signer()
-		txBatch := batch.ForTransaction(tx.ID(), origin)
-		receipt := receipts[i]
-		for _, output := range receipt.Outputs {
-			txBatch.Insert(output.Events, output.Transfers)
-		}
-	}
-	if err := batch.Commit(); err != nil {
-		log.Error(fmt.Sprintf("%+v", err))
-	}
-
-	// ignore fork when s
-	_, err = s.chain.AddBlock(b, receipts)
-	if err != nil {
-		log.Error(fmt.Sprintf("%+v", err))
-	}
+	return nil
 }

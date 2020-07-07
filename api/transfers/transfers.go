@@ -10,44 +10,52 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
+	"github.com/pkg/errors"
+	"github.com/vechain/thor/api/events"
 	"github.com/vechain/thor/api/utils"
+	"github.com/vechain/thor/chain"
 	"github.com/vechain/thor/logdb"
 )
 
 type Transfers struct {
-	db *logdb.LogDB
+	repo *chain.Repository
+	db   *logdb.LogDB
 }
 
-func New(db *logdb.LogDB) *Transfers {
+func New(repo *chain.Repository, db *logdb.LogDB) *Transfers {
 	return &Transfers{
+		repo,
 		db,
 	}
 }
 
 //Filter query logs with option
-func (t *Transfers) filter(ctx context.Context, filter *logdb.TransferFilter) ([]*FilteredTransfer, error) {
-	transfers, err := t.db.FilterTransfers(ctx, filter)
+func (t *Transfers) filter(ctx context.Context, filter *TransferFilter) ([]*FilteredTransfer, error) {
+	rng, err := events.ConvertRange(t.repo.NewBestChain(), filter.Range)
+	if err != nil {
+		return nil, err
+	}
+
+	transfers, err := t.db.FilterTransfers(ctx, &logdb.TransferFilter{
+		CriteriaSet: filter.CriteriaSet,
+		Range:       rng,
+		Options:     filter.Options,
+		Order:       filter.Order,
+	})
 	if err != nil {
 		return nil, err
 	}
 	tLogs := make([]*FilteredTransfer, len(transfers))
 	for i, trans := range transfers {
-		tLogs[i] = ConvertTransfer(trans)
+		tLogs[i] = convertTransfer(trans)
 	}
 	return tLogs, nil
 }
 
 func (t *Transfers) handleFilterTransferLogs(w http.ResponseWriter, req *http.Request) error {
-	var filter logdb.TransferFilter
+	var filter TransferFilter
 	if err := utils.ParseJSON(req.Body, &filter); err != nil {
-		return err
-	}
-	req.Body.Close()
-	order := req.URL.Query().Get("order")
-	if order != string(logdb.DESC) {
-		filter.Order = logdb.ASC
-	} else {
-		filter.Order = logdb.DESC
+		return utils.BadRequest(errors.WithMessage(err, "body"))
 	}
 	tLogs, err := t.filter(req.Context(), &filter)
 	if err != nil {

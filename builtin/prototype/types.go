@@ -7,35 +7,15 @@ package prototype
 
 import (
 	"math/big"
-
-	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/vechain/thor/state"
 )
 
-type userPlan struct {
+type creditPlan struct {
 	Credit       *big.Int
 	RecoveryRate *big.Int
 }
 
-var (
-	_ state.StorageEncoder = (*userPlan)(nil)
-	_ state.StorageDecoder = (*userPlan)(nil)
-)
-
-func (up *userPlan) Encode() ([]byte, error) {
-	if up.Credit.Sign() == 0 &&
-		up.RecoveryRate.Sign() == 0 {
-		return nil, nil
-	}
-	return rlp.EncodeToBytes(up)
-}
-
-func (up *userPlan) Decode(data []byte) error {
-	if len(data) == 0 {
-		*up = userPlan{&big.Int{}, &big.Int{}}
-		return nil
-	}
-	return rlp.DecodeBytes(data, up)
+func (u *creditPlan) IsEmpty() bool {
+	return u.Credit.Sign() == 0 && u.RecoveryRate.Sign() == 0
 }
 
 type userObject struct {
@@ -43,31 +23,11 @@ type userObject struct {
 	BlockTime  uint64
 }
 
-var (
-	_ state.StorageEncoder = (*userObject)(nil)
-	_ state.StorageDecoder = (*userObject)(nil)
-)
-
-func (u *userObject) Encode() ([]byte, error) {
-	if u.IsEmpty() {
-		return nil, nil
-	}
-	return rlp.EncodeToBytes(u)
-}
-
-func (u *userObject) Decode(data []byte) error {
-	if len(data) == 0 {
-		*u = userObject{&big.Int{}, 0}
-		return nil
-	}
-	return rlp.DecodeBytes(data, u)
-}
-
 func (u *userObject) IsEmpty() bool {
 	return u.UsedCredit.Sign() == 0 && u.BlockTime == 0
 }
 
-func (u *userObject) Credit(plan *userPlan, blockTime uint64) *big.Int {
+func (u *userObject) Credit(plan *creditPlan, blockTime uint64) *big.Int {
 	if u.UsedCredit.Sign() == 0 {
 		return plan.Credit
 	}

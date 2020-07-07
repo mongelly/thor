@@ -13,7 +13,7 @@ import (
 var (
 	networkFlag = cli.StringFlag{
 		Name:  "network",
-		Usage: "the network to join (test)",
+		Usage: "the network to join (main|test) or path to genesis file",
 	}
 	configDirFlag = cli.StringFlag{
 		Name:   "config-dir",
@@ -40,6 +40,21 @@ var (
 		Value: "",
 		Usage: "comma separated list of domains from which to accept cross origin requests to API",
 	}
+	apiTimeoutFlag = cli.IntFlag{
+		Name:  "api-timeout",
+		Value: 10000,
+		Usage: "API request timeout value in milliseconds",
+	}
+	apiCallGasLimitFlag = cli.IntFlag{
+		Name:  "api-call-gas-limit",
+		Value: 50000000,
+		Usage: "limit contract call gas",
+	}
+	apiBacktraceLimitFlag = cli.IntFlag{
+		Name:  "api-backtrace-limit",
+		Value: 1000,
+		Usage: "limit the distance between 'position' and best block for subscriptions APIs",
+	}
 	verbosityFlag = cli.IntFlag{
 		Name:  "verbosity",
 		Value: int(log15.LvlInfo),
@@ -58,7 +73,7 @@ var (
 	}
 	natFlag = cli.StringFlag{
 		Name:  "nat",
-		Value: "none",
+		Value: "any",
 		Usage: "port mapping mechanism (any|none|upnp|pmp|extip:<IP>)",
 	}
 	onDemandFlag = cli.BoolFlag{
@@ -67,6 +82,60 @@ var (
 	}
 	persistFlag = cli.BoolFlag{
 		Name:  "persist",
-		Usage: "blockchain data storage option, if setted data will be saved to disk",
+		Usage: "blockchain data storage option, if set data will be saved to disk",
+	}
+	gasLimitFlag = cli.IntFlag{
+		Name:  "gas-limit",
+		Value: 10000000,
+		Usage: "block gas limit(adaptive if set to 0)",
+	}
+	importMasterKeyFlag = cli.BoolFlag{
+		Name:  "import",
+		Usage: "import master key from keystore",
+	}
+	exportMasterKeyFlag = cli.BoolFlag{
+		Name:  "export",
+		Usage: "export master key to keystore",
+	}
+	targetGasLimitFlag = cli.IntFlag{
+		Name:  "target-gas-limit",
+		Value: 0,
+		Usage: "target block gas limit (adaptive if set to 0)",
+	}
+	bootNodeFlag = cli.StringFlag{
+		Name:  "bootnode",
+		Usage: "comma separated list of bootnode IDs",
+	}
+	pprofFlag = cli.BoolFlag{
+		Name:  "pprof",
+		Usage: "turn on go-pprof",
+	}
+	skipLogsFlag = cli.BoolFlag{
+		Name:  "skip-logs",
+		Usage: "skip writing event|transfer logs (/logs API will be disabled)",
+	}
+	verifyLogsFlag = cli.BoolFlag{
+		Name:   "verify-logs",
+		Usage:  "verify log db at startup",
+		Hidden: true,
+	}
+	cacheFlag = cli.IntFlag{
+		Name:  "cache",
+		Usage: "megabytes of ram allocated to trie nodes cache",
+		Value: 1024,
+	}
+	disablePrunerFlag = cli.BoolFlag{
+		Name:  "disable-pruner",
+		Usage: "disable state pruner to keep all history",
+	}
+	txPoolLimitFlag = cli.IntFlag{
+		Name:  "txpool-limit",
+		Value: 10000,
+		Usage: "set tx limit in pool",
+	}
+	txPoolLimitPerAccountFlag = cli.IntFlag{
+		Name:  "txpool-limit-per-account",
+		Value: 16,
+		Usage: "set tx limit per account in pool",
 	}
 )

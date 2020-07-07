@@ -18,8 +18,8 @@ import (
 
 // Clause for json marshal
 type Clause struct {
-	To    *thor.Address        `json:"to,string"`
-	Value math.HexOrDecimal256 `json:"value,string"`
+	To    *thor.Address        `json:"to"`
+	Value math.HexOrDecimal256 `json:"value"`
 	Data  string               `json:"data"`
 }
 
@@ -27,7 +27,7 @@ type Clause struct {
 type Clauses []Clause
 
 //ConvertClause convert a raw clause into a json format clause
-func ConvertClause(c *tx.Clause) Clause {
+func convertClause(c *tx.Clause) Clause {
 	return Clause{
 		c.To(),
 		math.HexOrDecimal256(*c.Value()),
@@ -45,12 +45,29 @@ func (c *Clause) String() string {
 		c.Data)
 }
 
-type RawTx struct {
-	Raw string `json:"raw"` //hex of transaction which rlp encoded
+//Transaction transaction
+type Transaction struct {
+	ID           thor.Bytes32        `json:"id"`
+	ChainTag     byte                `json:"chainTag"`
+	BlockRef     string              `json:"blockRef"`
+	Expiration   uint32              `json:"expiration"`
+	Clauses      Clauses             `json:"clauses"`
+	GasPriceCoef uint8               `json:"gasPriceCoef"`
+	Gas          uint64              `json:"gas"`
+	Origin       thor.Address        `json:"origin"`
+	Delegator    *thor.Address       `json:"delegator"`
+	Nonce        math.HexOrDecimal64 `json:"nonce"`
+	DependsOn    *thor.Bytes32       `json:"dependsOn"`
+	Size         uint32              `json:"size"`
+	Meta         *TxMeta             `json:"meta"`
 }
 
-func (r *RawTx) decode() (*tx.Transaction, error) {
-	data, err := hexutil.Decode(r.Raw)
+type RawTx struct {
+	Raw string `json:"raw"`
+}
+
+func (rtx *RawTx) decode() (*tx.Transaction, error) {
+	data, err := hexutil.Decode(rtx.Raw)
 	if err != nil {
 		return nil, err
 	}
@@ -61,43 +78,26 @@ func (r *RawTx) decode() (*tx.Transaction, error) {
 	return tx, nil
 }
 
-//Transaction transaction
-type Transaction struct {
-	ID           thor.Bytes32        `json:"id,string"`
-	Size         uint32              `json:"size"`
-	ChainTag     byte                `json:"chainTag"`
-	BlockRef     string              `json:"blockRef"`
-	Expiration   uint32              `json:"expiration"`
-	Clauses      Clauses             `json:"clauses"`
-	GasPriceCoef uint8               `json:"gasPriceCoef"`
-	Gas          uint64              `json:"gas"`
-	DependsOn    *thor.Bytes32       `json:"dependsOn,string"`
-	Nonce        math.HexOrDecimal64 `json:"nonce"`
-	Origin       thor.Address        `json:"origin,string"`
-	Block        BlockContext        `json:"block"`
-}
-
 type rawTransaction struct {
-	Block BlockContext `json:"block"`
 	RawTx
+	Meta *TxMeta `json:"meta"`
 }
 
-//ConvertTransaction convert a raw transaction into a json format transaction
-func ConvertTransaction(tx *tx.Transaction) (*Transaction, error) {
-	//tx signer
-	signer, err := tx.Signer()
-	if err != nil {
-		return nil, err
-	}
+//convertTransaction convert a raw transaction into a json format transaction
+func convertTransaction(tx *tx.Transaction, header *block.Header) *Transaction {
+	//tx origin
+	origin, _ := tx.Origin()
+	delegator, _ := tx.Delegator()
+
 	cls := make(Clauses, len(tx.Clauses()))
 	for i, c := range tx.Clauses() {
-		cls[i] = ConvertClause(c)
+		cls[i] = convertClause(c)
 	}
 	br := tx.BlockRef()
 	t := &Transaction{
 		ChainTag:     tx.ChainTag(),
 		ID:           tx.ID(),
-		Origin:       signer,
+		Origin:       origin,
 		BlockRef:     hexutil.Encode(br[:]),
 		Expiration:   tx.Expiration(),
 		Nonce:        math.HexOrDecimal64(tx.Nonce()),
@@ -106,30 +106,41 @@ func ConvertTransaction(tx *tx.Transaction) (*Transaction, error) {
 		Gas:          tx.Gas(),
 		DependsOn:    tx.DependsOn(),
 		Clauses:      cls,
+		Delegator:    delegator,
 	}
-	return t, nil
+
+	if header != nil {
+		t.Meta = &TxMeta{
+			BlockID:        header.ID(),
+			BlockNumber:    header.Number(),
+			BlockTimestamp: header.Timestamp(),
+		}
+	}
+	return t
 }
 
-type BlockContext struct {
-	ID        thor.Bytes32 `json:"id"`
-	Number    uint32       `json:"number"`
-	Timestamp uint64       `json:"timestamp"`
+type TxMeta struct {
+	BlockID        thor.Bytes32 `json:"blockID"`
+	BlockNumber    uint32       `json:"blockNumber"`
+	BlockTimestamp uint64       `json:"blockTimestamp"`
 }
 
-type TxContext struct {
-	ID     thor.Bytes32 `json:"id"`
-	Origin thor.Address `json:"origin"`
+type ReceiptMeta struct {
+	BlockID        thor.Bytes32 `json:"blockID"`
+	BlockNumber    uint32       `json:"blockNumber"`
+	BlockTimestamp uint64       `json:"blockTimestamp"`
+	TxID           thor.Bytes32 `json:"txID"`
+	TxOrigin       thor.Address `json:"txOrigin"`
 }
 
 //Receipt for json marshal
 type Receipt struct {
 	GasUsed  uint64                `json:"gasUsed"`
 	GasPayer thor.Address          `json:"gasPayer"`
-	Paid     *math.HexOrDecimal256 `json:"paid,string"`
-	Reward   *math.HexOrDecimal256 `json:"reward,string"`
+	Paid     *math.HexOrDecimal256 `json:"paid"`
+	Reward   *math.HexOrDecimal256 `json:"reward"`
 	Reverted bool                  `json:"reverted"`
-	Block    BlockContext          `json:"block"`
-	Tx       TxContext             `json:"tx"`
+	Meta     ReceiptMeta           `json:"meta"`
 	Outputs  []*Output             `json:"outputs"`
 }
 
@@ -158,7 +169,7 @@ type Transfer struct {
 func convertReceipt(txReceipt *tx.Receipt, header *block.Header, tx *tx.Transaction) (*Receipt, error) {
 	reward := math.HexOrDecimal256(*txReceipt.Reward)
 	paid := math.HexOrDecimal256(*txReceipt.Paid)
-	signer, err := tx.Signer()
+	origin, err := tx.Origin()
 	if err != nil {
 		return nil, err
 	}
@@ -168,14 +179,12 @@ func convertReceipt(txReceipt *tx.Receipt, header *block.Header, tx *tx.Transact
 		Paid:     &paid,
 		Reward:   &reward,
 		Reverted: txReceipt.Reverted,
-		Tx: TxContext{
-			tx.ID(),
-			signer,
-		},
-		Block: BlockContext{
+		Meta: ReceiptMeta{
 			header.ID(),
 			header.Number(),
 			header.Timestamp(),
+			tx.ID(),
+			origin,
 		},
 	}
 	receipt.Outputs = make([]*Output, len(txReceipt.Outputs))

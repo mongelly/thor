@@ -8,6 +8,7 @@ package prototype
 import (
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/vechain/thor/state"
 	"github.com/vechain/thor/thor"
 )
@@ -22,19 +23,21 @@ func New(addr thor.Address, state *state.State) *Prototype {
 }
 
 func (p *Prototype) Bind(self thor.Address) *Binding {
-	return &Binding{p, self}
+	return &Binding{p.addr, p.state, self}
 }
 
 type Binding struct {
-	prototype *Prototype
-	self      thor.Address
+	addr  thor.Address
+	state *state.State
+	self  thor.Address
 }
 
 func (b *Binding) userKey(user thor.Address) thor.Bytes32 {
 	return thor.Blake2b(b.self.Bytes(), user.Bytes(), []byte("user"))
 }
-func (b *Binding) userPlanKey() thor.Bytes32 {
-	return thor.Blake2b(b.self.Bytes(), []byte("user-plan"))
+
+func (b *Binding) creditPlanKey() thor.Bytes32 {
+	return thor.Blake2b(b.self.Bytes(), []byte("credit-plan"))
 }
 
 func (b *Binding) sponsorKey(sponsor thor.Address) thor.Bytes32 {
@@ -45,79 +48,129 @@ func (b *Binding) curSponsorKey() thor.Bytes32 {
 	return thor.Blake2b(b.self.Bytes(), []byte("cur-sponsor"))
 }
 
-func (b *Binding) getStorage(key thor.Bytes32, val interface{}) {
-	b.prototype.state.GetStructuredStorage(b.prototype.addr, key, val)
+func (b *Binding) getUserObject(user thor.Address) (uo *userObject, err error) {
+	err = b.state.DecodeStorage(b.addr, b.userKey(user), func(raw []byte) error {
+		if len(raw) == 0 {
+			uo = &userObject{&big.Int{}, 0}
+			return nil
+		}
+		return rlp.DecodeBytes(raw, &uo)
+	})
+	return
 }
 
-func (b *Binding) setStorage(key thor.Bytes32, val interface{}) {
-	b.prototype.state.SetStructuredStorage(b.prototype.addr, key, val)
-}
-
-func (b *Binding) IsUser(user thor.Address) bool {
-	var uo userObject
-	b.getStorage(b.userKey(user), &uo)
-	return !uo.IsEmpty()
-}
-
-func (b *Binding) AddUser(user thor.Address, blockTime uint64) {
-	b.setStorage(b.userKey(user), &userObject{
-		&big.Int{},
-		blockTime,
+func (b *Binding) setUserObject(user thor.Address, uo *userObject) error {
+	return b.state.EncodeStorage(b.addr, b.userKey(user), func() ([]byte, error) {
+		if uo.IsEmpty() {
+			return nil, nil
+		}
+		return rlp.EncodeToBytes(uo)
 	})
 }
 
-func (b *Binding) RemoveUser(user thor.Address) {
-	userKey := b.userKey(user)
-	b.setStorage(userKey, uint8(0))
+func (b *Binding) getCreditPlan() (cp *creditPlan, err error) {
+	err = b.state.DecodeStorage(b.addr, b.creditPlanKey(), func(raw []byte) error {
+		if len(raw) == 0 {
+			cp = &creditPlan{&big.Int{}, &big.Int{}}
+			return nil
+		}
+		return rlp.DecodeBytes(raw, &cp)
+	})
+	return
 }
 
-func (b *Binding) UserCredit(user thor.Address, blockTime uint64) *big.Int {
-	var uo userObject
-	b.getStorage(b.userKey(user), &uo)
-	if uo.IsEmpty() {
-		return &big.Int{}
+func (b *Binding) setCreditPlan(cp *creditPlan) error {
+	return b.state.EncodeStorage(b.addr, b.creditPlanKey(), func() ([]byte, error) {
+		if cp.IsEmpty() {
+			return nil, nil
+		}
+		return rlp.EncodeToBytes(cp)
+	})
+}
+
+func (b *Binding) IsUser(user thor.Address) (bool, error) {
+	uo, err := b.getUserObject(user)
+	if err != nil {
+		return false, err
 	}
-	var up userPlan
-	b.getStorage(b.userPlanKey(), &up)
-	return uo.Credit(&up, blockTime)
+	return !uo.IsEmpty(), nil
 }
 
-func (b *Binding) SetUserCredit(user thor.Address, credit *big.Int, blockTime uint64) {
-	var up userPlan
-	b.getStorage(b.userPlanKey(), &up)
+func (b *Binding) AddUser(user thor.Address, blockTime uint64) error {
+	return b.setUserObject(user, &userObject{&big.Int{}, blockTime})
+}
+
+func (b *Binding) RemoveUser(user thor.Address) error {
+	// set to empty
+	return b.setUserObject(user, &userObject{&big.Int{}, 0})
+}
+
+func (b *Binding) UserCredit(user thor.Address, blockTime uint64) (*big.Int, error) {
+	uo, err := b.getUserObject(user)
+	if err != nil {
+		return nil, err
+	}
+	if uo.IsEmpty() {
+		return &big.Int{}, nil
+	}
+	cp, err := b.getCreditPlan()
+	if err != nil {
+		return nil, err
+	}
+	return uo.Credit(cp, blockTime), nil
+}
+
+func (b *Binding) SetUserCredit(user thor.Address, credit *big.Int, blockTime uint64) error {
+	up, err := b.getCreditPlan()
+	if err != nil {
+		return err
+	}
 	used := new(big.Int).Sub(up.Credit, credit)
 	if used.Sign() < 0 {
 		used = &big.Int{}
 	}
-	b.setStorage(b.userKey(user), &userObject{used, blockTime})
+	return b.setUserObject(user, &userObject{used, blockTime})
 }
 
-func (b *Binding) UserPlan() (credit, recoveryRate *big.Int) {
-	var up userPlan
-	b.getStorage(b.userPlanKey(), &up)
-	return up.Credit, up.RecoveryRate
+func (b *Binding) CreditPlan() (credit, recoveryRate *big.Int, err error) {
+	cp, err := b.getCreditPlan()
+	if err != nil {
+		return nil, nil, err
+	}
+	return cp.Credit, cp.RecoveryRate, nil
 }
 
-func (b *Binding) SetUserPlan(credit, recoveryRate *big.Int) {
-	b.setStorage(b.userPlanKey(), &userPlan{credit, recoveryRate})
+func (b *Binding) SetCreditPlan(credit, recoveryRate *big.Int) error {
+	return b.setCreditPlan(&creditPlan{credit, recoveryRate})
 }
 
-func (b *Binding) Sponsor(sponsor thor.Address, yesOrNo bool) {
-	sponsorKey := b.sponsorKey(sponsor)
-	b.setStorage(sponsorKey, yesOrNo)
+func (b *Binding) Sponsor(sponsor thor.Address, flag bool) error {
+	return b.state.EncodeStorage(b.addr, b.sponsorKey(sponsor), func() ([]byte, error) {
+		if !flag {
+			return nil, nil
+		}
+		return rlp.EncodeToBytes(&flag)
+	})
 }
 
-func (b *Binding) IsSponsor(sponsor thor.Address) bool {
-	var yesOrNo bool
-	b.getStorage(b.sponsorKey(sponsor), &yesOrNo)
-	return yesOrNo
+func (b *Binding) IsSponsor(sponsor thor.Address) (flag bool, err error) {
+	err = b.state.DecodeStorage(b.addr, b.sponsorKey(sponsor), func(raw []byte) error {
+		if len(raw) == 0 {
+			return nil
+		}
+		return rlp.DecodeBytes(raw, &flag)
+	})
+	return
 }
 
 func (b *Binding) SelectSponsor(sponsor thor.Address) {
-	b.setStorage(b.curSponsorKey(), sponsor)
+	b.state.SetStorage(b.addr, b.curSponsorKey(), thor.BytesToBytes32(sponsor.Bytes()))
 }
 
-func (b *Binding) CurrentSponsor() (addr thor.Address) {
-	b.getStorage(b.curSponsorKey(), &addr)
-	return
+func (b *Binding) CurrentSponsor() (thor.Address, error) {
+	val, err := b.state.GetStorage(b.addr, b.curSponsorKey())
+	if err != nil {
+		return thor.Address{}, err
+	}
+	return thor.BytesToAddress(val.Bytes()), nil
 }

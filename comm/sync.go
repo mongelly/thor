@@ -8,7 +8,6 @@ package comm
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/pkg/errors"
@@ -26,59 +25,82 @@ func (c *Communicator) sync(peer *Peer, headNum uint32, handler HandleBlockStrea
 }
 
 func (c *Communicator) download(peer *Peer, fromNum uint32, handler HandleBlockStream) error {
+
+	// it's important to set cap to 2
+	errCh := make(chan error, 2)
+
 	ctx, cancel := context.WithCancel(c.ctx)
-	var errValue atomic.Value
-	blockCh := make(chan *block.Block, 32)
+	blockCh := make(chan *block.Block, 2048)
 
 	var goes co.Goes
 	goes.Go(func() {
 		defer cancel()
 		if err := handler(ctx, blockCh); err != nil {
-			errValue.Store(err)
+			errCh <- err
 		}
 	})
 	goes.Go(func() {
 		defer close(blockCh)
+		var blocks []*block.Block
 		for {
 			result, err := proto.GetBlocksFromNumber(ctx, peer, fromNum)
 			if err != nil {
-				errValue.Store(err)
+				errCh <- err
 				return
 			}
 			if len(result) == 0 {
 				return
 			}
 
+			blocks = blocks[:0]
 			for _, raw := range result {
 				var blk block.Block
 				if err := rlp.DecodeBytes(raw, &blk); err != nil {
-					errValue.Store(errors.Wrap(err, "invalid block"))
-					return
-				}
-				if _, err := blk.Header().Signer(); err != nil {
-					errValue.Store(errors.Wrap(err, "invalid block"))
+					errCh <- errors.Wrap(err, "invalid block")
 					return
 				}
 				if blk.Header().Number() != fromNum {
-					errValue.Store(errors.New("broken sequence"))
+					errCh <- errors.New("broken sequence")
 					return
 				}
-				peer.MarkBlock(blk.Header().ID())
 				fromNum++
+				blocks = append(blocks, &blk)
+			}
 
+			<-co.Parallel(func(queue chan<- func()) {
+				for _, blk := range blocks {
+					h := blk.Header()
+					queue <- func() { h.ID() }
+					for _, tx := range blk.Transactions() {
+						tx := tx
+						queue <- func() {
+							tx.ID()
+							tx.UnprovedWork()
+							_, _ = tx.IntrinsicGas()
+							_, _ = tx.Delegator()
+						}
+					}
+				}
+			})
+
+			for _, blk := range blocks {
+				peer.MarkBlock(blk.Header().ID())
 				select {
 				case <-ctx.Done():
 					return
-				case blockCh <- &blk:
+				case blockCh <- blk:
 				}
 			}
 		}
 	})
 	goes.Wait()
-	if err := errValue.Load(); err != nil {
-		return err.(error)
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
 	}
-	return nil
 }
 
 func (c *Communicator) findCommonAncestor(peer *Peer, headNum uint32) (uint32, error) {
@@ -91,7 +113,7 @@ func (c *Communicator) findCommonAncestor(peer *Peer, headNum uint32) (uint32, e
 		if err != nil {
 			return false, err
 		}
-		id, err := c.chain.GetTrunkBlockID(num)
+		id, err := c.repo.NewBestChain().GetBlockID(num)
 		if err != nil {
 			return false, err
 		}
@@ -172,8 +194,8 @@ func (c *Communicator) syncTxs(peer *Peer) {
 		}
 
 		for _, tx := range result {
-			peer.MarkTransaction(tx.ID())
-			c.txPool.Add(tx)
+			peer.MarkTransaction(tx.Hash())
+			_ = c.txPool.StrictlyAdd(tx)
 			select {
 			case <-c.ctx.Done():
 				return
